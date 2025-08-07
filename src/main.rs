@@ -1,10 +1,11 @@
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use clap::Parser;
 use csv::{ReaderBuilder, Trim};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::fs::File;
+use tracing::{debug, error, info, warn};
 
 #[derive(Parser)]
 struct Opts {
@@ -51,6 +52,15 @@ fn main() -> Result<()> {
     let opts = Opts::parse();
     let file = File::open(&opts.filename)?;
 
+    let (non_blocking_writer, _tracing_worker_guard) =
+        tracing_appender::non_blocking(File::create("transaction_engine.log")?);
+    tracing_subscriber::fmt()
+        .with_writer(non_blocking_writer)
+        .with_ansi(false)
+        .with_line_number(true)
+        .with_level(true)
+        .init();
+
     let mut reader = ReaderBuilder::new()
         .flexible(true)
         .trim(Trim::All)
@@ -59,7 +69,7 @@ fn main() -> Result<()> {
         .deserialize::<Transaction>()
         .map(|r| r.map_err(Into::into));
 
-    let clients = process_transactions(records)?;
+    let clients = process_transactions(records);
 
     //Output client data
     println!("client,available,held,total,locked");
@@ -73,7 +83,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn process_transactions<T>(records: T) -> Result<HashMap<u16, Client>>
+fn process_transactions<T>(records: T) -> HashMap<u16, Client>
 where
     T: IntoIterator<Item = Result<Transaction>>,
 {
@@ -82,10 +92,11 @@ where
     let mut disputed_transaction: HashSet<u32> = HashSet::new();
 
     for record in records {
+        info!("Processing {:?}", record);
         let current_transaction = match record {
             Ok(r) => r,
             Err(e) => {
-                //log error
+                warn!("Invalid transaction {e}");
                 continue;
             }
         };
@@ -93,6 +104,7 @@ where
 
         // Ignore all transactions from locked client
         if client.locked {
+            debug!("Client {} is locked", current_transaction.client_id);
             continue;
         }
         // Convert all if conditions above to improve
@@ -102,12 +114,14 @@ where
                 if transaction_records.contains_key(&current_transaction.id) {
                     // This transaction ID has been used before
                     // There is some error
+                    warn!("Duplicate transaction id");
                     continue;
                 }
 
                 let amount = if let Some(a) = current_transaction.amount {
                     a
                 } else {
+                    error!("Empty amount for deposit transaction");
                     continue;
                 };
 
@@ -132,10 +146,12 @@ where
                 let amount = if let Some(a) = current_transaction.amount {
                     a
                 } else {
+                    error!("Empty amount for deposit transaction");
                     continue;
                 };
                 // Sufficient funds available
                 if client.available_funds < amount {
+                    info!("Unable to withdraw. Insufficient funds for transaction");
                     continue;
                 }
                 client.available_funds -= amount;
@@ -149,11 +165,11 @@ where
                         transaction_type: current_transaction.kind,
                     },
                 );
-                // record some error
             }
             TransactionType::Dispute => {
                 // Make sure if there is no double disputes open
                 if disputed_transaction.contains(&current_transaction.id) {
+                    info!("Dispute already open for transaction");
                     continue;
                 }
 
@@ -162,18 +178,24 @@ where
                     if let Some(tr) = transaction_records.get(&current_transaction.id) {
                         tr
                     } else {
+                        error!("No such transaction exists");
                         continue;
                     };
 
                 // Check for malicious client
-                if transaction_record.client_id != current_transaction.client_id
-                    || transaction_record.transaction_type != TransactionType::Deposit
-                {
+                if transaction_record.client_id != current_transaction.client_id {
+                    error!("Unable to open dispute. Transaction id doesn't match with client.");
+                    continue;
+                }
+
+                if transaction_record.transaction_type != TransactionType::Deposit {
+                    error!("Unable to open dispute for withdrawal transactions");
                     continue;
                 }
 
                 // Make sure client has enough funds
                 if client.available_funds < transaction_record.amount {
+                    info!("Insufficient funds to open a dispute");
                     continue;
                 }
 
@@ -187,6 +209,7 @@ where
             TransactionType::Resolve => {
                 // Ignore if transaction not disputed
                 if !disputed_transaction.contains(&current_transaction.id) {
+                    info!("Transaction not disputed");
                     continue;
                 }
 
@@ -194,11 +217,13 @@ where
                     if let Some(tr) = transaction_records.get(&current_transaction.id) {
                         tr
                     } else {
+                        error!("No such transaction exists");
                         continue;
                     };
 
                 if transaction_record.client_id != current_transaction.client_id {
                     // Malicious actor
+                    error!("Unable to open dispute. Transaction id doesn't match with client");
                     continue;
                 }
                 // Update the funds
@@ -211,6 +236,7 @@ where
             TransactionType::Chargeback => {
                 // Ignore if transaction not disputed
                 if !disputed_transaction.contains(&current_transaction.id) {
+                    info!("Transaction not disputed");
                     continue;
                 }
 
@@ -218,12 +244,15 @@ where
                     if let Some(tr) = transaction_records.get(&current_transaction.id) {
                         tr
                     } else {
+                        error!("No such transaction exists");
                         continue;
                     };
 
                 // Update the funds
                 client.held_funds -= transaction_record.amount;
                 client.total_funds -= transaction_record.amount;
+
+                info!("Client {} locked", current_transaction.id);
                 // Lock the client
                 client.locked = true;
 
@@ -232,7 +261,7 @@ where
             }
         }
     }
-    Ok(clients)
+    clients
 }
 
 #[cfg(test)]
@@ -276,7 +305,7 @@ mod tests {
             }),
         ];
 
-        let clients = process_transactions(records).unwrap();
+        let clients = process_transactions(records);
         let client_1 = clients.get(&1).unwrap();
 
         assert_eq!(client_1.available_funds, dec!(13.6974));
@@ -327,7 +356,7 @@ mod tests {
             }),
         ];
 
-        let clients = process_transactions(records).unwrap();
+        let clients = process_transactions(records);
         let client_1 = clients.get(&1).unwrap();
 
         assert_eq!(client_1.available_funds, dec!(122.166));
@@ -366,7 +395,7 @@ mod tests {
             }),
         ];
 
-        let clients = process_transactions(records).unwrap();
+        let clients = process_transactions(records);
         let client_1 = clients.get(&1).unwrap();
 
         assert_eq!(client_1.available_funds, dec!(11.084));
@@ -398,7 +427,7 @@ mod tests {
             }),
         ];
 
-        let clients = process_transactions(records).unwrap();
+        let clients = process_transactions(records);
         let client_1 = clients.get(&1).unwrap();
 
         assert_eq!(client_1.available_funds, dec!(11.084));
@@ -424,7 +453,7 @@ mod tests {
             }),
         ];
 
-        let clients = process_transactions(records).unwrap();
+        let clients = process_transactions(records);
         let client_1 = clients.get(&1).unwrap();
 
         assert_eq!(client_1.available_funds, dec!(12.34));
@@ -456,7 +485,7 @@ mod tests {
             }),
         ];
 
-        let clients = process_transactions(records).unwrap();
+        let clients = process_transactions(records);
         let client_1 = clients.get(&1).unwrap();
 
         assert_eq!(client_1.available_funds, dec!(1.256));
@@ -488,7 +517,7 @@ mod tests {
             }),
         ];
 
-        let clients = process_transactions(records).unwrap();
+        let clients = process_transactions(records);
         let client_1 = clients.get(&1).unwrap();
 
         assert_eq!(client_1.available_funds, dec!(11.106));
@@ -520,7 +549,7 @@ mod tests {
             }),
         ];
 
-        let clients = process_transactions(records).unwrap();
+        let clients = process_transactions(records);
         let client_1 = clients.get(&1).unwrap();
 
         assert_eq!(client_1.available_funds, dec!(12.34));
@@ -570,7 +599,7 @@ mod tests {
             }),
         ];
 
-        let clients = process_transactions(records).unwrap();
+        let clients = process_transactions(records);
         let client_1 = clients.get(&1).unwrap();
 
         assert_eq!(client_1.available_funds, dec!(0.1234));
@@ -621,12 +650,12 @@ mod tests {
             Ok(Transaction {
                 kind: TransactionType::Dispute,
                 client_id: 1,
-                id: 3,
+                id: 1,
                 amount: None,
             }),
         ];
 
-        let clients = process_transactions(records).unwrap();
+        let clients = process_transactions(records);
         let client_1 = clients.get(&1).unwrap();
 
         assert_eq!(client_1.available_funds, dec!(12.34));
@@ -658,7 +687,7 @@ mod tests {
             }),
         ];
 
-        let clients = process_transactions(records).unwrap();
+        let clients = process_transactions(records);
         let client_1 = clients.get(&1).unwrap();
 
         assert_eq!(client_1.available_funds, dec!(13.574));
@@ -690,7 +719,7 @@ mod tests {
             }),
         ];
 
-        let clients = process_transactions(records).unwrap();
+        let clients = process_transactions(records);
         let client_1 = clients.get(&1).unwrap();
 
         assert_eq!(client_1.available_funds, dec!(13.574));
@@ -728,7 +757,7 @@ mod tests {
             }),
         ];
 
-        let clients = process_transactions(records).unwrap();
+        let clients = process_transactions(records);
         let client_1 = clients.get(&1).unwrap();
 
         assert_eq!(client_1.available_funds, dec!(12.34));
@@ -760,7 +789,7 @@ mod tests {
             }),
         ];
 
-        let clients = process_transactions(records).unwrap();
+        let clients = process_transactions(records);
         let client_1 = clients.get(&1).unwrap();
 
         assert_eq!(client_1.available_funds, dec!(11.106));
@@ -792,7 +821,7 @@ mod tests {
             }),
         ];
 
-        let clients = process_transactions(records).unwrap();
+        let clients = process_transactions(records);
         let client_1 = clients.get(&1).unwrap();
 
         assert_eq!(client_1.available_funds, dec!(12.34));
@@ -837,7 +866,7 @@ mod tests {
             }),
         ];
 
-        let clients = process_transactions(records).unwrap();
+        let clients = process_transactions(records);
         let client_1 = clients.get(&1).unwrap();
 
         assert_eq!(client_1.available_funds, dec!(0));
@@ -876,7 +905,7 @@ mod tests {
             }),
         ];
 
-        let clients = process_transactions(records).unwrap();
+        let clients = process_transactions(records);
         let client_1 = clients.get(&1).unwrap();
 
         assert_eq!(client_1.available_funds, dec!(0));
@@ -902,7 +931,7 @@ mod tests {
             }),
         ];
 
-        let clients = process_transactions(records).unwrap();
+        let clients = process_transactions(records);
         let client_1 = clients.get(&1).unwrap();
 
         assert_eq!(client_1.available_funds, dec!(12.34));
@@ -928,7 +957,7 @@ mod tests {
             }),
         ];
 
-        let clients = process_transactions(records).unwrap();
+        let clients = process_transactions(records);
         let client_1 = clients.get(&1).unwrap();
 
         assert_eq!(client_1.available_funds, dec!(12.34));
@@ -954,7 +983,7 @@ mod tests {
             }),
         ];
 
-        let clients = process_transactions(records).unwrap();
+        let clients = process_transactions(records);
         let client_1 = clients.get(&1).unwrap();
 
         assert_eq!(client_1.available_funds, dec!(12.34));
@@ -962,21 +991,4 @@ mod tests {
         assert_eq!(client_1.held_funds, dec!(0));
         assert!(!client_1.locked);
     }
-    // Withdraw funds before depositing ✅
-    // Transaction ID repeated for withdraw ✅
-    // Transaction ID repeated for deposit ✅
-    // Check simple dispute ✅
-    // Check dispute if no funds available ✅
-    // Check simple resolve ✅
-    // Check simple chargeback ✅
-    // Check all type for locked account ✅
-    // Ignore chargeback if not disputed ✅
-    // Ignore resolve if not disputed ✅
-    // Second dispute record is ignored ✅
-    // Ignore dispute if Tx ID not present ✅
-    // Ignore resolve if Tx ID not present ✅
-    // Ignore dispute if Tx ID and client dont match ✅
-    // Ignore resolve if Tx ID and client dont match ✅
-    // Ignore if Dispute opened for withdrawal, not deposit ✅
-    // Check if deposit or withdrawal sent without amount ✅
 }
